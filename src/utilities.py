@@ -6,16 +6,46 @@ import lightly
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
+import torchvision
+
 from ss_models import *
 
 import imblearn
 import sklearn
 from sklearn.metrics import roc_curve, auc
-
-
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
+
+def save_json(metrics_dict, saving_dir, fname):
+    with open(saving_dir.joinpath(fname),'w') as f:
+        json.dump(metrics_dict,f)
+
+def get_imgs_per_cat(y_encoded):
+    #count the images in each category
+    data_dict = {}
+    for el in y_encoded:
+        if el not in data_dict.keys():
+            data_dict.update({el:1})
+        else:
+            data_dict[el] += 1
+    return data_dict
+
+
+def get_class_weights(y_encoded,encoding_dict):
+    """Calculates the weights for the Cross Entropy loss """
+    data_dict = get_imgs_per_cat(y_encoded)       
+    N = sum(data_dict.values())
+    print('Percentage of images in each category:\n')              
+    #calculate weights as the inverse of the frequency of each class
+    weights = []
+    for k in range(len(data_dict)):
+        v = data_dict[k]
+        weights.append(N/v)
+        print('{}: {:.6g} %'.format(encoding_dict[k],100.0*v/N))    
+    print('Weights: {}\n'.format(weights))
+    print('\n')      
+    return weights
 
 def label_encoding(y):
     le = LabelEncoder()
@@ -27,7 +57,66 @@ def label_encoding(y):
 
     return y_encoded, encoding_dict
 
+def parse_dataset(data_path):
 
+    img_paths = []
+    labels = []
+    for label in data_path.iterdir():
+        for img in data_path.joinpath(label).iterdir():
+            img_paths.append(img)
+            labels.append(label.name)
+
+    return img_paths, labels
+
+def make_random_split(imgs,labels,train_size = 0.5):
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=1.0 - train_size)
+    idx_train, idx_test = next(sss.split(np.array(imgs),np.array(labels)))
+
+    train_imgs = [imgs[i] for i in idx_train]
+    train_labels = [labels[i] for i in idx_train]
+
+    test_imgs = [imgs[i] for i in idx_test]
+    test_labels = [labels[i] for i in idx_test]
+    
+    return train_imgs, train_labels, test_imgs, test_labels
+
+def print_metrics(metrics):
+    loss = metrics['val_loss']
+    acc = metrics['acc']
+    f1 = metrics['f1']
+    recall = metrics['recall']
+    precision = metrics['precision']
+    print(f'loss: {loss:.3f} acc:{acc:.3f} f1:{f1:.3f} precision:{precision:.3f} recall:{recall:.3f}')
+
+
+def load_self_supervised(pretrained_dir,device):
+
+    model_path = pretrained_dir.joinpath('checkpoint.pth')
+    conf_path = pretrained_dir.joinpath('conf.json')
+    with open(conf_path,'r') as f:
+        conf = json.load(f)
+
+    resnet_dict = {
+        18: torchvision.models.resnet18(pretrained=False),
+        34: torchvision.models.resnet34(pretrained=False),
+        50: torchvision.models.resnet50(pretrained=False),
+        101: torchvision.models.resnet101(pretrained=False),
+    }
+
+    backbone = resnet_dict[conf['model_size']]
+
+    if conf['benchmarking']:
+        model = MoCoModel_benchmarking(backbone,None,1,num_ftrs=conf['num_ftrs'],).to(device)
+    else:
+        model = MoCoModel(backbone,num_ftrs=conf['num_ftrs']).to(device)
+
+    model.backbone.load_state_dict(torch.load(model_path))
+
+    return model, conf
+
+
+# to do: change name
 class BWDataset(torch.utils.data.Dataset):
     def __init__(self, imgs_path,labels, transform):
    
@@ -45,70 +134,8 @@ class BWDataset(torch.utils.data.Dataset):
         label = torch.tensor(self.labels[idx])
         return tensor_image,label
 
-def parse_dataset(data_path):
 
-    img_paths = []
-    labels = []
-    for label in data_path.iterdir():
-        for img in data_path.joinpath(label).iterdir():
-            img_paths.append(img)
-            labels.append(label.name)
-
-    return img_paths, labels
-
-
-def make_random_split(imgs,labels,train_size = 0.5):
-
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=1.0 - train_size)
-
-    idx_train, idx_test = next(sss.split(np.array(imgs),np.array(labels)))
-
-    train_imgs = [imgs[i] for i in idx_train]
-    train_labels = [labels[i] for i in idx_train]
-
-    test_imgs = [imgs[i] for i in idx_test]
-    test_labels = [labels[i] for i in idx_test]
-    
-    return train_imgs, train_labels, test_imgs, test_labels
-
-
-def load_simcrl(simclr_results_path,n_categories,device,model_size = 18):
-    
-    #load config
-    conf_path = simclr_results_path.joinpath('conf.json')
-    with open(conf_path,'r') as f:
-        conf = json.load(f)
-
-    #load model
-    model_path = simclr_results_path.joinpath('checkpoint.pth')
-    num_ftrs = conf['num_ftrs']
-    model_name = conf['model_name']
-
-    resnet = lightly.models.ResNetGenerator('resnet-'+str(model_size))
-    last_conv_channels = list(resnet.children())[-1].in_features
-    backbone = nn.Sequential(
-        *list(resnet.children())[:-1],
-        nn.Conv2d(last_conv_channels, num_ftrs, 1),
-        nn.AdaptiveAvgPool2d(1)
-    )
-
-    if model_name == 'simclr':
-        model = lightly.models.SimCLR(backbone, num_ftrs=num_ftrs)
-    elif model_name == 'moco':
-        model = lightly.models.MoCo(backbone, num_ftrs=num_ftrs, m=0.99, batch_shuffle=True)
-        
-    encoder = lightly.embedding.SelfSupervisedEmbedding(
-        model,
-        None,
-        None,
-        None
-    )
-
-    encoder.model.load_state_dict(torch.load(model_path))
-    teacher = Teacher(encoder.model,num_ftrs,n_categories).to(device)
-    return teacher
-
-
+# to do: add classification to name
 def fine_tune(**kwargs):
     model = kwargs.get('model')
     trainloader = kwargs.get('trainloader')
@@ -118,16 +145,17 @@ def fine_tune(**kwargs):
     loss_function = kwargs.get('loss_function')
     saving_dir = kwargs.get('saving_dir')
     max_epochs = kwargs.get('max_epochs',50)
-    patience = kwargs.get('patience',3)
+    patience = kwargs.get('patience',10)
     checkpoint_name = kwargs.get('checkpoint_name','fine_tuned')
 
     count = 0
     best_loss = 1e9
     for epoch in range(max_epochs):
+        train_loss = 0.0
         for image,label in trainloader:
             image, label = image.to(device), label.to(device)
             optimizer.zero_grad()
-            loss = loss_function(model(image), label)
+            loss = loss_function(model(image), label)/image.shape[0]
             loss.backward()
             optimizer.step()
                 
@@ -152,13 +180,6 @@ def fine_tune(**kwargs):
     return model, best_metrics
 
 
-def print_metrics(metrics):
-    acc = metrics['acc']
-    f1 = metrics['f1']
-    recall = metrics['recall']
-    precision = metrics['precision']
-    print(f'acc:{acc:.3f} f1:{f1:.3f} precision:{precision:.3f} recall:{recall:.3f}')
-     
 
 def evaluate(model,testloader,loss_function,device):
   val_loss = 0
@@ -173,13 +194,15 @@ def evaluate(model,testloader,loss_function,device):
       ground_truth_list += list(label.cpu())
       predictions_list += list(predicted.cpu())
 
+  val_loss /= len(testloader.dataset)
+
   acc = sklearn.metrics.accuracy_score(ground_truth_list,predictions_list)
   f1 = sklearn.metrics.f1_score(ground_truth_list,predictions_list,average = 'macro')
   precision = sklearn.metrics.precision_score(ground_truth_list,predictions_list,average = 'macro')
   recall = sklearn.metrics.recall_score(ground_truth_list,predictions_list,average = 'macro')
   cm = sklearn.metrics.confusion_matrix(ground_truth_list,predictions_list)
-  sensitivity = imblearn.metrics.sensitivity_score(ground_truth_list,predictions_list)
-  specificity = imblearn.metrics.specificity_score(ground_truth_list,predictions_list)
+  sensitivity = imblearn.metrics.sensitivity_score(ground_truth_list,predictions_list,average = 'macro')
+  specificity = imblearn.metrics.specificity_score(ground_truth_list,predictions_list,average = 'macro')
 
   if cm[1,1]+cm[0,1] == 0:
       ppv = 0.0
@@ -191,10 +214,13 @@ def evaluate(model,testloader,loss_function,device):
   else:
       npv = cm[0,0]/(cm[0,0]+cm[1,0])
 
-  _,auc = compute_ROC(ground_truth_list, predictions_list,{0:'a',1:'b'},title = '')
+  #_,auc = compute_ROC(ground_truth_list, predictions_list,{0:'a',1:'b'},title = '')
+  auc = 0.0
 
-  
-  print(f'acc:{acc:.3f} f1:{f1:.3f} precision:{precision:.3f} recall:{recall:.3f} auc:{auc:.3f}')
+  ground_truth_list = [int(item) for item in ground_truth_list]
+  predictions_list = [int(item) for item in predictions_list]
+
+  print(f'loss: {val_loss:.3f} acc:{acc:.3f} f1:{f1:.3f} precision:{precision:.3f} recall:{recall:.3f} auc:{auc:.3f}')
 
   metrics_dict = {
       'val_loss':val_loss,
@@ -211,14 +237,16 @@ def evaluate(model,testloader,loss_function,device):
       'TN':int(cm[0,0]),
       'FP':int(cm[0,1]),
       'FN':int(cm[1,0]),
+      'ground_truth_list':ground_truth_list,
+      'predictions_list':predictions_list
       }
 
   return metrics_dict
 
 def distillation(**kwargs):
-    teacher = kwargs.get('teacher')
-    student = kwargs.get('student')
-    U_loader = kwargs.get('U_loader')
+    #teacher = kwargs.get('teacher')
+    model = kwargs.get('model')
+    trainloader = kwargs.get('trainloader')
     valloader = kwargs.get('valloader')
     device = kwargs.get('device')
     optimizer = kwargs.get('optimizer')
@@ -229,23 +257,26 @@ def distillation(**kwargs):
     patience = kwargs.get('patience',3)
     checkpoint_name = kwargs.get('checkpoint_name','distilled')
 
-    teacher.eval()
-    student.train()
+    #teacher.eval()
+    model.train()
 
     count = 0
     best_loss = 1e9
     for epoch in range(max_epochs):
-        for image,_ in U_loader:
+        for image,label in trainloader:
             image = image.to(device)
-            loss = distill_loss(teacher(image),student(image))
+            label = label.to(device)
+            #label = teacher(image).to(device)
+            #print(teacher(image).shape)
+            loss = distill_loss(model(image),label)
             loss.backward()
             optimizer.step()
                 
-        metrics_dict = evaluate(student,valloader,classification_loss,device)
+        metrics_dict = evaluate(model,valloader,classification_loss,device)
         val_loss = metrics_dict['val_loss']
         if val_loss < best_loss:
                 if saving_dir:
-                    torch.save(student.state_dict(),saving_dir.joinpath(f'{checkpoint_name}.pth'))
+                    torch.save(model.state_dict(),saving_dir.joinpath(f'{checkpoint_name}.pth'))
                 best_loss = val_loss
                 best_metrics = metrics_dict
                 
@@ -257,9 +288,9 @@ def distillation(**kwargs):
 
     #load best model
     if saving_dir:
-        student.load_state_dict(torch.load(saving_dir.joinpath(f'{checkpoint_name}.pth')))
+        model.load_state_dict(torch.load(saving_dir.joinpath(f'{checkpoint_name}.pth')))
 
-    return student, best_metrics
+    return model, best_metrics
 
 
 def compute_ROC(ground_truth_list, predictions_list,encoding_dict,title = ''):
